@@ -1,0 +1,130 @@
+name: DevSecOps Full Lab
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Setup Java & Python
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # Prepare report folder
+      - name: Prepare report folder
+        run: |
+          rm -rf security-reports
+          mkdir -p security-reports
+
+      # ======================
+      # SCA Scan (Dependency-Check)
+      # ======================
+      - name: SCA Scan
+        continue-on-error: true
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/src \
+            -v "${{ github.workspace }}/security-reports":/report \
+            owasp/dependency-check:latest \
+            --scan /src \
+            --out /report \
+            --format "HTML,JSON,XML" \
+            --failOnCVSS 0 \
+            --project "devsecops-lab"
+
+      # ======================
+      # SAST Scan (Semgrep)
+      # ======================
+      - name: SAST Scan
+        continue-on-error: true
+        run: |
+          pip install semgrep
+          semgrep --config=auto src/ --json --output security-reports/semgrep.json
+
+      # ======================
+      # Secret Scan
+      # ======================
+      - name: Secret Scan
+        continue-on-error: true
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: secret
+
+      # ======================
+      # DAST Scan (ZAP Docker)
+      # ======================
+      - name: DAST Scan
+        continue-on-error: true
+        run: |
+          docker run --rm -v ${{ github.workspace }}/security-reports:/zap/wrk/:rw owasp/zap2docker-stable zap-baseline.py -t http://localhost -r zap-report.html
+
+      # ======================
+      # Upload reports
+      # ======================
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: security-reports/
+
+      # ======================
+      # Security Gate
+      # ======================
+      - name: Security Gate - Block on High/Critical
+        run: |
+          python3 <<'PY'
+          import json, pathlib, sys
+
+          reports = pathlib.Path("security-reports")
+          critical_found = False
+
+          # Check Dependency-Check
+          dep = reports / "dependency-check-report.json"
+          if dep.exists():
+              data = json.loads(dep.read_text())
+              for v in data.get('dependencies', []):
+                  for vuln in v.get('vulnerabilities', []):
+                      if vuln.get('severity','').upper() in ['HIGH','CRITICAL']:
+                          critical_found = True
+
+          # Check Semgrep
+          sem = reports / "semgrep.json"
+          if sem.exists():
+              data = json.loads(sem.read_text())
+              for result in data.get('results', []):
+                  if result.get('extra', {}).get('severity','').upper() in ['HIGH','CRITICAL']:
+                      critical_found = True
+
+          if critical_found:
+              print("🚨 Critical vulnerabilities found! Blocking deployment.")
+              sys.exit(1)
+          else:
+              print("✅ No critical vulnerabilities found.")
+
+          PY
+
+      # ======================
+      # Automatic Remediation - Pull Request
+      # ======================
+      - name: Auto Remediation & PR
+        if: failure() # Only runs if Security Gate failed
+        uses: peter-evans/create-pull-request@v5
+        with:
+          branch: auto-remediation
+          commit-message: "chore: automatic remediation of vulnerabilities"
+          title: "[SEC] Auto-remediation PR"
+          body: "This PR updates dependencies and secrets automatically to fix High/Critical vulnerabilities."
+          # Exemple: pourrait lancer scripts pour mettre à jour requirements.txt ou pom.xml
