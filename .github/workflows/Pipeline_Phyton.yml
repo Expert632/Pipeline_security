@@ -1,0 +1,85 @@
+name: Advanced Security Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  security:
+    runs-on: ubuntu-latest
+    steps:
+
+    # 1️⃣ Checkout repository
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    # 2️⃣ Setup Python
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    # 3️⃣ Install dependencies
+    - name: Install required tools
+      run: |
+        pip install semgrep
+        sudo apt-get update
+        sudo apt-get install -y openjdk-11-jdk unzip wget jq
+        # Dependency-Check
+        wget https://github.com/jeremylong/DependencyCheck/releases/download/v8.4.1/dependency-check-8.4.1-release.zip
+        unzip dependency-check-8.4.1-release.zip -d dependency-check
+        sudo chmod +x dependency-check/dependency-check/bin/dependency-check.sh
+
+    # 4️⃣ Run Semgrep (SAST)
+    - name: Run Semgrep
+      run: semgrep --config=auto --json --output=semgrep.json
+
+    # 5️⃣ Run Dependency-Check (SCA)
+    - name: Run Dependency-Check
+      run: dependency-check/dependency-check/bin/dependency-check.sh --project "DemoProject" --scan ./ --format JSON --out .
+
+    # 6️⃣ Optional Secret scan
+    - name: Run Secret Scan
+      run: grep -RInE "API[_-]?KEY|SECRET|PASSWORD|TOKEN" . || true
+
+    # 7️⃣ Summarize High/Critical Vulnerabilities
+    - name: Summarize High/Critical Vulnerabilities
+      run: python3 ci-scripts/summarize_security_reports.py
+      continue-on-error: true
+
+    # 8️⃣ Upload security artifacts
+    - name: Upload security artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          summary.md
+          high_critical.csv
+          semgrep.json
+          dependency-check-report.json
+
+    # 9️⃣ Gate de sécurité: fail PR si High/Critical trouvé
+    - name: Security Gate Check
+      id: security_gate
+      run: |
+        COUNT=$(wc -l < high_critical.csv)
+        # header + at least 1 vuln = fail
+        if [ "$COUNT" -gt 1 ]; then
+          echo "Vulnerabilities High/Critical detected! Failing pipeline..."
+          exit 1
+        else
+          echo "No High/Critical vulnerabilities found."
+        fi
+
+    # 🔟 Optional: Create automatic PR for remediation (example SCA)
+    - name: Auto PR Remediation for Dependencies
+      if: steps.security_gate.outcome == 'failure'
+      uses: peter-evans/create-pull-request@v5
+      with:
+        branch: "dependency-remediation-branch"
+        commit-message: "Auto-fix vulnerabilities High/Critical"
+        title: "Remediation: Update vulnerable dependencies"
+        body: |
+          This PR automatically updates dependencies with known High/Critical vulnerabilities.
+        path: ""  # Update all files changed by dependency updates
